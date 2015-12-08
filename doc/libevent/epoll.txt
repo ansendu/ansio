@@ -1,0 +1,101 @@
+乱七八糟的整理：
+
+3、epoll的优点
+<1>支持一个进程打开大数 目的socket描述符(FD)
+    select 最不能忍受的是一个进程所打开的FD是有一定限制的，由FD_SETSIZE设置，默认值是2048。对于那些需要支持的上万连接数目的IM服务器来说显 然太少了。这时候你一是可以选择修改这个宏然后重新编译内核，不过资料也同时指出这样会带来网络效率的下降，二是可以选择多进程的解决方案(传统的 Apache方案)，不过虽然linux上面创建进程的代价比较小，但仍旧是不可忽视的，加上进程间数据同步远比不上线程间同步的高效，所以也不是一种完 美的方案。不过 epoll则没有这个限制，它所支持的FD上限是最大可以打开文件的数目，这个数字一般远大于2048,举个例子,在1GB内存的机器上大约是10万左 右，具体数目可以cat /proc/sys/fs/file-max察看,一般来说这个数目和系统内存关系很大。
+
+<2>IO 效率不随FD数目增加而线性下降
+     传统的select/poll另一个致命弱点就是当你拥有一个很大的socket集合，不过由于网络延时，任一时间只有部分的socket是"活跃"的， 但是select/poll每次调用都会线性扫描全部的集合，导致效率呈现线性下降。但是epoll不存在这个问题，它只会对"活跃"的socket进行 操作---这是因为在内核实现中epoll是根据每个fd上面的callback函数实现的。那么，只有"活跃"的socket才会主动的去调用 callback函数，其他idle状态socket则不会，在这点上，epoll实现了一个"伪"AIO，因为这时候推动力在os内核。在一些 benchmark中，如果所有的socket基本上都是活跃的---比如一个高速LAN环境，epoll并不比select/poll有什么效率，相 反，如果过多使用epoll_ctl,效率相比还有稍微的下降。但是一旦使用idle connections模拟WAN环境,epoll的效率就远在select/poll之上了。
+
+<3>使用mmap加速内核 与用户空间的消息传递。
+    这点实际上涉及到epoll的具体实现了。无论是select,poll还是epoll都需要内核把FD消息通知给用户空间，如何避免不必要的内存拷贝就 很重要，在这点上，epoll是通过内核于用户空间mmap同一块内存实现的。而如果你想我一样从2.5内核就关注epoll的话，一定不会忘记手工 mmap这一步的。
+
+<4>内核微调
+    这一点其实不算epoll的优点了，而是整个linux平台的优点。也许你可以怀疑 linux平台，但是你无法回避linux平台赋予你微调内核的能力。比如，内核TCP/IP协议栈使用内存池管理sk_buff结构，那么可以在运行时 期动态调整这个内存pool(skb_head_pool)的大小--- 通过echo XXXX>/proc/sys/net/core/hot_list_length完成。再比如listen函数的第2个参数(TCP完成3次握手 的数据包队列长度)，也可以根据你平台内存大小动态调整。更甚至在一个数据包面数目巨大但同时每个数据包本身大小却很小的特殊系统上尝试最新的NAPI网 卡驱动架构。
+
+4、epoll的工作模式
+    令人高兴的是，2.6内核的epoll比其2.5开发版本的/dev/epoll简洁了许多，所以，大部分情况下，强大的东西往往是简单的。唯一有点麻烦 是epoll有2种工作方式:LT和ET。
+LT(level triggered)是缺省的工作方式，并且同时支持block和no-block socket.在这种做法中，内核告诉你一个文件描述符是否就绪了，然后你可以对这个就绪的fd进行IO操作。如果你不作任何操作，内核还是会继续通知你 的，所以，这种模式编程出错误可能性要小一点。传统的select/poll都是这种模型的代表．
+ET (edge-triggered)是高速工作方式，只支持no-block socket。在这种模式下，当描述符从未就绪变为就绪时，内核通过epoll告诉你。然后它会假设你知道文件描述符已经就绪，并且不会再为那个文件描述 符发送更多的就绪通知，直到你做了某些操作导致那个文件描述符不再为就绪状态了(比如，你在发送，接收或者接收请求，或者发送接收的数据少于一定量时导致 了一个EWOULDBLOCK 错误）。但是请注意，如果一直不对这个fd作IO操作(从而导致它再次变成未就绪)，内核不会发送更多的通知(only once),不过在TCP协议中，ET模式的加速效用仍需要更多的benchmark确认。
+epoll只有epoll_create,epoll_ctl,epoll_wait 3个系统调用，具体用法请参考http://www.xmailserver.org/linux-patches/nio-improve.html ，在http://www.kegel.com/rn/也有一个完整的例子，大家一看就知道如何使用了
+Leader/follower模式线程 pool实现，以及和epoll的配合。
+
+5、 epoll的使用方法
+    首先通过create_epoll(int maxfds)来创建一个epoll的句柄，其中maxfds为你epoll所支持的最大句柄数。这个函数会返回一个新的epoll句柄，之后的所有操作 将通过这个句柄来进行操作。在用完之后，记得用close()来关闭这个创建出来的epoll句柄。之后在你的网络主循环里面，每一帧的调用 epoll_wait(int epfd, epoll_event events, int max events, int timeout)来查询所有的网络接口，看哪一个可以读，哪一个可以写了。基本的语法为：
+nfds = epoll_wait(kdpfd, events, maxevents, -1);
+    其中kdpfd为用epoll_create创建之后的句柄，events是一个 epoll_event*的指针，当epoll_wait这个函数操作成功之后，epoll_events里面将储存所有的读写事件。 max_events是当前需要监听的所有socket句柄数。最后一个timeout是 epoll_wait的超时，为0的时候表示马上返回，为-1的时候表示一直等下去，直到有事件范围，为任意正整数的时候表示等这么长的时间，如果一直没 有事件，则范围。一般如果网络主循环是单独的线程的话，可以用-1来等，这样可以保证一些效率，如果是和主逻辑在同一个线程的话，则可以用0来保证主循环 的效率。
+
+
+libevent的基本操作单元是事件。每个事件代表一组条件的集合，这些条件包括：
+l  文件描述符已经就绪，可以读取或者写入
+l  文件描述符变为就绪状态，可以读取或者写入（仅对于边沿触发IO）
+l  超时事件
+l  发生某信号
+l  用户触发事件
+所有事件具有相似的生命周期。调用libevent函数设置事件并且关联到event_base之后，
+事件进入“已初始化（initialized）”状态。此时可以将事件添加到event_base中，这使之进入“未决（pending）”状态。在未决状态下，
+如果触发事件的条件发生（比如说，文件描述符的状态改变，或者超时时间到达），则事件进入“激活（active）”状态，（用户提供的）
+事件回调函数将被执行。如果配置为“持久的（persistent）”，当执行回调时，事件将保持为未决状态；否则，执行完回调后，
+事件不再是未决的。删除操作可以让未决事件成为非未决（已初始化）的；添加操作可以让非未决事件再次成为未决的。
+
+
+1.3 关于事件持久性
+默认情况下，每当未决事件成为激活的（因为fd已经准备好读取或者写入，或者因为超时），事件将在其回调被执行前成为非未决的。如果想让事件再次成为未决的，可以在回调函数中再次对其调用event_add（）。
+然而，如果设置了EV_PERSIST标志，事件就是持久的。这意味着即使其回调被激活，事件还是会保持为未决状态。如果想在回调中让事件成为非未决的，可以对其调用event_del（）。
+每次执行事件回调的时候，持久事件的超时值会被复位。因此，如果具有EV_READ|EV_PERSIST标志，以及5秒的超时值，则事件将在以下情况下成为激活的：
+l  套接字已经准备好被读取的时候
+l  从最后一次成为激活的开始，已经逝去5秒
+
+
+
+event_del 只是在 base 中删除当前 event ，并不是 free event event_del() 在当前的 base 中删除该 event 的注册 ，注意这个时候 event 的资源还没有释放
+
+event_free() 在当前的 zend 中删除该 event ，注意，并没有执行 event_del() ， 等到下次 php_callback 时，会检测该 event 时候存在，没有则 callback 直接返回
+
+要释放事件，调用event_free（）。对未决或者激活状态的事件调用event_free（）是安全的：在释放事件之前，函数将会使事件成为非激活和非未决的。 // see libevent doc
+
+asyncStream 供 client 种类的异步访问使用，注意 asyncStream() 的 connect 是 block 的, 需要有另外的处理
+
+php 的 socket_connect 直接调用的 connect() kernel 函数
+
+/* True iff e is an error that means a read/write operation can be retried. */
+#define EVUTIL_ERR_RW_RETRIABLE(e)				\
+	((e) == EINTR || (e) == EAGAIN)
+/* True iff e is an error that means an connect can be retried. */
+#define EVUTIL_ERR_CONNECT_RETRIABLE(e)			\
+	((e) == EINTR || (e) == EINPROGRESS)
+/* True iff e is an error that means a accept can be retried. */
+#define EVUTIL_ERR_ACCEPT_RETRIABLE(e)			\
+	((e) == EINTR || (e) == EAGAIN || (e) == ECONNABORTED)
+
+	注: php 中的 accept 并没有处理以上的错误
+
+	accept() 的 监听套接字是非阻塞的，所以这里没有问题，另外经过测试，使用过 event_add (EV_READ) 这种方式，每次都能 accept 成功，即使 win 上断开
+
+
+socket connect 非阻塞的时候，当连接成功或者失败的时候，首先触发的是 EV_WRITE 事件, 如果此时使用 ev_add 增加 EV_TIMEOUT, 虽然会触发，但是 socket 的状态并不会改变。
+
+SO_RCVTIMEO SO_SNDTIMEO 对 connect 是不起作用的。
+
+
+
+从2.0.1-alpha版本开始，可以有任意多个事件因为同样的条件而未决。比如说，可以有两个事件因为某个给定的fd已经就绪，可以读取而成为激活的。这种情况下，多个事件回调被执行的次序是不确定的。
+
+1.3 关于事件持久性
+默认情况下，每当未决事件成为激活的（因为fd已经准备好读取或者写入，或者因为超时），事件将在其回调被执行前成为非未决的。如果想让事件再次成为未决的，可以在回调函数中再次对其调用event_add（）。
+然而，如果设置了EV_PERSIST标志，事件就是持久的。这意味着即使其回调被激活，事件还是会保持为未决状态。如果想在回调中让事件成为非未决的，可以对其调用event_del（）。
+每次执行事件回调的时候，持久事件的超时值会被复位。因此，如果具有EV_READ|EV_PERSIST标志，以及5秒的超时值，则事件将在以下情况下成为激活的：
+v 套接字已经准备好被读取的时候
+v 从最后一次成为激活的开始，已经逝去5秒
+
+这里可以设定连接超时,待实现。
+
+关于信号的警告
+在当前版本的libevent和大多数后端中，每个进程任何时刻只能有一个event_base可以监听信号。如果同时向两个event_base添加信号事件，即使是不同的信号，也只有一个event_base可以取得信号。
+kqueue后端没有这个限制。
+
+当 fork 的时候需要重新建立 base.
+
+还有两个问题：
+1 连接来了，直接触发了 ReadEOF 事件, 后面触发 evBufWriteEvent()
+2 事件是批量来的，如下场景是，evread -> write() -> close()(这里设置了下次) -> evwrite()
