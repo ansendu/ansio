@@ -1,5 +1,5 @@
 # ansio
-ansyc event based on libevent 基于libevent的异步服务框架，通过自定义内存数据处理和异步延迟方式持久花数据可以同时处理百万级别并发(内置websocket服务)底层基于linux epoll
+async event based on libevent 基于libevent的异步服务框架，通过自定义内存数据处理和异步延迟方式持久花数据可以同时处理百万级别并发(内置websocket服务)底层基于linux epoll
 
 #安装
 安装libevent模块php部分加入libevent.so路径在runtime下面
